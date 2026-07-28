@@ -38,6 +38,37 @@ function createMessageId() {
     : `${Date.now()}-${Math.random()}`;
 }
 
+function cancelledError() {
+  return new DOMException("The request was cancelled.", "AbortError");
+}
+
+function isAbortError(error: unknown) {
+  return (
+    error instanceof DOMException && error.name === "AbortError"
+  );
+}
+
+function abortableDelay(milliseconds: number, signal: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(cancelledError());
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      signal.removeEventListener("abort", cancel);
+      resolve();
+    }, milliseconds);
+
+    function cancel() {
+      window.clearTimeout(timeout);
+      reject(cancelledError());
+    }
+
+    signal.addEventListener("abort", cancel, { once: true });
+  });
+}
+
 function pendingLabel(state: AssistantState) {
   switch (state) {
     case "capturing":
@@ -78,6 +109,7 @@ export default function App() {
 
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [state, setState] = useState<AssistantState>("ready");
   const [status, setStatus] = useState("Checking local model…");
   const [modelAvailable, setModelAvailable] = useState(false);
@@ -100,10 +132,15 @@ export default function App() {
 
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const conversationEndRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeAssistantMessageIdRef = useRef<string | null>(null);
+  const copiedResetTimeoutRef = useRef<number | null>(null);
   const recordingRef = useRef(false);
   const startRecordingPromiseRef = useRef<Promise<void> | null>(null);
 
   const demoMode = !tauriRuntime;
+  const generating =
+    state === "capturing" || state === "thinking" || state === "streaming";
   const busy =
     state === "listening" ||
     state === "transcribing" ||
@@ -194,10 +231,36 @@ export default function App() {
     });
   }, [messages, state]);
 
-  function setMessageContent(messageId: string, content: string) {
+  useEffect(() => {
+    if (!generating) return;
+
+    function handleEscape(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      stopGenerating();
+    }
+
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
+  }, [generating]);
+
+  useEffect(
+    () => () => {
+      abortControllerRef.current?.abort();
+      if (copiedResetTimeoutRef.current != null) {
+        window.clearTimeout(copiedResetTimeoutRef.current);
+      }
+    },
+    [],
+  );
+
+  function updateMessage(
+    messageId: string,
+    patch: Partial<ChatMessage>,
+  ) {
     setMessages((current) =>
       current.map((message) =>
-        message.id === messageId ? { ...message, content } : message,
+        message.id === messageId ? { ...message, ...patch } : message,
       ),
     );
   }
@@ -209,18 +272,141 @@ export default function App() {
         id: createMessageId(),
         role: "assistant",
         content,
+        status: "error",
       },
     ]);
   }
 
+  function buildHistory(source: ChatMessage[]) {
+    return source
+      .filter((message) => {
+        if (!message.content.trim()) return false;
+        if (message.role === "user") return true;
+        return message.status === "complete";
+      })
+      .map<ConversationMessage>(({ role, content }) => ({ role, content }));
+  }
+
+  async function runAssistantResponse(
+    prompt: string,
+    history: ConversationMessage[],
+    assistantMessageId: string,
+  ) {
+    const controller = new AbortController();
+    const requestId = createMessageId();
+    abortControllerRef.current = controller;
+    activeAssistantMessageIdRef.current = assistantMessageId;
+    speechSynthesizer.cancel();
+
+    let completedAnswer = "";
+
+    try {
+      if (demoMode) {
+        if (screenEnabled) {
+          setState("capturing");
+          await abortableDelay(520, controller.signal);
+        }
+
+        setState("thinking");
+        await abortableDelay(740, controller.signal);
+        completedAnswer = DEMO_RESPONSE;
+        updateMessage(assistantMessageId, {
+          content: completedAnswer,
+          status: "complete",
+        });
+      } else {
+        if (!modelAvailable) throw new Error(status);
+
+        let screen;
+        if (screenEnabled) {
+          if (!captureProvider) {
+            throw new Error("Native screen capture is unavailable.");
+          }
+
+          setState("capturing");
+          screen = await captureProvider.captureActiveDisplay();
+          if (controller.signal.aborted) throw cancelledError();
+        }
+
+        setState("thinking");
+        let receivedToken = false;
+
+        await provider.streamAnswer(
+          {
+            requestId,
+            question: prompt,
+            model: MODEL,
+            screen,
+            history,
+          },
+          (token) => {
+            if (
+              controller.signal.aborted ||
+              activeAssistantMessageIdRef.current !== assistantMessageId
+            ) {
+              return;
+            }
+
+            receivedToken = true;
+            completedAnswer += token;
+            setState("streaming");
+            updateMessage(assistantMessageId, {
+              content: completedAnswer,
+              status: "pending",
+            });
+          },
+          controller.signal,
+        );
+
+        if (controller.signal.aborted) throw cancelledError();
+
+        if (!receivedToken) {
+          completedAnswer =
+            "Oz completed the request but did not return a text response.";
+        }
+
+        updateMessage(assistantMessageId, {
+          content: completedAnswer,
+          status: "complete",
+        });
+      }
+
+      if (activeAssistantMessageIdRef.current === assistantMessageId) {
+        setState("answer");
+      }
+      if (spokenAnswers && completedAnswer) {
+        speechSynthesizer.speak(completedAnswer);
+      }
+    } catch (error) {
+      if (isAbortError(error) || controller.signal.aborted) {
+        updateMessage(assistantMessageId, {
+          content: completedAnswer || "Response stopped.",
+          status: "stopped",
+        });
+      } else {
+        updateMessage(assistantMessageId, {
+          content: errorMessage(error, "Oz could not complete the request."),
+          status: "error",
+        });
+      }
+
+      if (activeAssistantMessageIdRef.current === assistantMessageId) {
+        setState("answer");
+      }
+    } finally {
+      if (activeAssistantMessageIdRef.current === assistantMessageId) {
+        activeAssistantMessageIdRef.current = null;
+        abortControllerRef.current = null;
+        requestAnimationFrame(() => inputRef.current?.focus());
+      }
+    }
+  }
+
   async function ask(prompt: string) {
     const trimmedPrompt = prompt.trim();
-    if (!trimmedPrompt) return;
+    if (!trimmedPrompt || busy) return;
 
-    const history: ConversationMessage[] = messages
-      .filter((message) => message.content.trim())
-      .map(({ role, content }) => ({ role, content }));
-
+    const history = buildHistory(messages);
     const userMessage: ChatMessage = {
       id: createMessageId(),
       role: "user",
@@ -236,72 +422,71 @@ export default function App() {
         id: assistantMessageId,
         role: "assistant",
         content: "",
+        status: "pending",
       },
     ]);
-    speechSynthesizer.cancel();
 
-    let completedAnswer = "";
+    await runAssistantResponse(trimmedPrompt, history, assistantMessageId);
+  }
 
+  async function retryMessage(messageId: string) {
+    if (busy) return;
+
+    const assistantIndex = messages.findIndex(
+      (message) => message.id === messageId && message.role === "assistant",
+    );
+    const userIndex = assistantIndex - 1;
+    const userMessage = messages[userIndex];
+
+    if (
+      assistantIndex < 1 ||
+      !userMessage ||
+      userMessage.role !== "user"
+    ) {
+      return;
+    }
+
+    const history = buildHistory(messages.slice(0, userIndex));
+    setMessages((current) =>
+      current.slice(0, assistantIndex + 1).map((message, index) =>
+        index === assistantIndex
+          ? { ...message, content: "", status: "pending" }
+          : message,
+      ),
+    );
+
+    await runAssistantResponse(userMessage.content, history, messageId);
+  }
+
+  async function copyMessage(messageId: string, content: string) {
     try {
-      if (demoMode) {
-        if (screenEnabled) {
-          setState("capturing");
-          await new Promise((resolve) => window.setTimeout(resolve, 520));
-        }
+      await navigator.clipboard.writeText(content);
+      setCopiedMessageId(messageId);
 
-        setState("thinking");
-        await new Promise((resolve) => window.setTimeout(resolve, 740));
-        completedAnswer = DEMO_RESPONSE;
-        setMessageContent(assistantMessageId, completedAnswer);
-      } else {
-        if (!modelAvailable) throw new Error(status);
-
-        let screen;
-        if (screenEnabled) {
-          if (!captureProvider) {
-            throw new Error("Native screen capture is unavailable.");
-          }
-
-          setState("capturing");
-          screen = await captureProvider.captureActiveDisplay();
-        }
-
-        setState("thinking");
-        let receivedToken = false;
-
-        await provider.streamAnswer(
-          {
-            question: trimmedPrompt,
-            model: MODEL,
-            screen,
-            history,
-          },
-          (token) => {
-            receivedToken = true;
-            completedAnswer += token;
-            setState("streaming");
-            setMessageContent(assistantMessageId, completedAnswer);
-          },
-        );
-
-        if (!receivedToken) {
-          completedAnswer =
-            "Oz completed the request but did not return a text response.";
-          setMessageContent(assistantMessageId, completedAnswer);
-        }
+      if (copiedResetTimeoutRef.current != null) {
+        window.clearTimeout(copiedResetTimeoutRef.current);
       }
 
-      setState("answer");
-      if (spokenAnswers) speechSynthesizer.speak(completedAnswer);
+      copiedResetTimeoutRef.current = window.setTimeout(() => {
+        setCopiedMessageId(null);
+        copiedResetTimeoutRef.current = null;
+      }, 1_600);
     } catch (error) {
-      setMessageContent(
-        assistantMessageId,
-        errorMessage(error, "Oz could not complete the request."),
-      );
-      setState("answer");
-    } finally {
-      requestAnimationFrame(() => inputRef.current?.focus());
+      console.error("Oz could not copy the response.", error);
     }
+  }
+
+  function stopGenerating() {
+    const assistantMessageId = activeAssistantMessageIdRef.current;
+    const controller = abortControllerRef.current;
+    if (!assistantMessageId || !controller || controller.signal.aborted) return;
+
+    speechSynthesizer.cancel();
+    controller.abort();
+    updateMessage(assistantMessageId, {
+      status: "stopped",
+    });
+    setState("answer");
   }
 
   async function submit(event: FormEvent) {
@@ -394,9 +579,11 @@ export default function App() {
   }
 
   function reset() {
+    abortControllerRef.current?.abort();
     speechSynthesizer.cancel();
     setQuestion("");
     setMessages([]);
+    setCopiedMessageId(null);
     setState("ready");
     requestAnimationFrame(() => inputRef.current?.focus());
   }
@@ -422,6 +609,9 @@ export default function App() {
     }
   }
 
+  const latestAssistant = [...messages]
+    .reverse()
+    .find((message) => message.role === "assistant");
   const stateLabel = {
     ready: "Ready",
     listening: "Listening",
@@ -429,7 +619,12 @@ export default function App() {
     capturing: "Capturing screen",
     thinking: "Thinking locally",
     streaming: "Answering locally",
-    answer: "Response ready",
+    answer:
+      latestAssistant?.status === "stopped"
+        ? "Response stopped"
+        : latestAssistant?.status === "error"
+          ? "Needs attention"
+          : "Response ready",
   }[state];
 
   const processingCopy = {
@@ -566,7 +761,15 @@ export default function App() {
                     <span className="message-author">
                       {message.role === "user" ? "YOU" : "OZ"}
                     </span>
-                    <div className="message-bubble">
+                    <div
+                      className={`message-bubble${
+                        message.status === "error"
+                          ? " message-bubble--error"
+                          : message.status === "stopped"
+                            ? " message-bubble--stopped"
+                            : ""
+                      }`}
+                    >
                       {isPending ? (
                         <div className="message-pending">
                           <span className="message-pending__dots" aria-hidden="true">
@@ -580,6 +783,40 @@ export default function App() {
                         <p>{message.content}</p>
                       )}
                     </div>
+
+                    {message.role === "assistant" &&
+                      message.content &&
+                      !(isLastMessage && busy) && (
+                        <div className="message-actions">
+                          {message.status === "stopped" && (
+                            <span className="message-result message-result--stopped">
+                              Stopped
+                            </span>
+                          )}
+                          {message.status === "error" && (
+                            <span className="message-result message-result--error">
+                              Error
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void copyMessage(message.id, message.content)
+                            }
+                          >
+                            {copiedMessageId === message.id ? "Copied" : "Copy"}
+                          </button>
+                          {isLastMessage && (
+                            <button
+                              type="button"
+                              onClick={() => void retryMessage(message.id)}
+                              disabled={busy}
+                            >
+                              ↻ Retry
+                            </button>
+                          )}
+                        </div>
+                      )}
                   </article>
                 );
               })}
@@ -678,13 +915,25 @@ export default function App() {
               Screen
             </button>
 
-            <button
-              className="send-button"
-              disabled={!question.trim() || busy}
-              aria-label="Ask Oz"
-            >
-              ↑
-            </button>
+            {generating ? (
+              <button
+                type="button"
+                className="send-button stop-button"
+                aria-label="Stop generating"
+                title="Stop generating (Esc)"
+                onClick={stopGenerating}
+              >
+                <span aria-hidden="true" />
+              </button>
+            ) : (
+              <button
+                className="send-button"
+                disabled={!question.trim() || busy}
+                aria-label="Ask Oz"
+              >
+                ↑
+              </button>
+            )}
           </form>
         </div>
 

@@ -2,14 +2,20 @@ mod capture;
 mod ollama;
 mod voice;
 
+use futures_util::future::{AbortHandle, Abortable};
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+};
 use tauri::{
-    AppHandle,
     ipc::Channel,
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Emitter, Manager, State, WebviewWindow,
+    AppHandle, Emitter, Manager, State, WebviewWindow,
 };
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
@@ -25,6 +31,11 @@ struct PrivacyState {
     screen_context_enabled: AtomicBool,
 }
 
+#[derive(Default)]
+struct OllamaRequestState {
+    cancellations: Mutex<HashMap<String, AbortHandle>>,
+}
+
 #[tauri::command]
 async fn capture_active_display(
     window: WebviewWindow,
@@ -37,7 +48,6 @@ async fn capture_active_display(
     window
         .hide()
         .map_err(|error| format!("Oz could not hide its overlay before capture: {error}"))?;
-
     let capture_result = tauri::async_runtime::spawn_blocking(|| {
         std::thread::sleep(std::time::Duration::from_millis(160));
         capture::capture_active_display()
@@ -60,8 +70,58 @@ async fn get_ollama_status(model: String) -> ollama::ModelStatus {
 async fn ask_ollama(
     request: ollama::AskRequest,
     on_token: Channel<String>,
+    request_state: State<'_, OllamaRequestState>,
 ) -> Result<(), String> {
-    ollama::stream_answer(request, on_token).await
+    let request_id = request.request_id().trim().to_string();
+    if request_id.is_empty() || request_id.len() > 128 {
+        return Err("Oz received an invalid request identifier.".to_string());
+    }
+
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    {
+        let mut cancellations = request_state
+            .cancellations
+            .lock()
+            .map_err(|_| "Oz could not start the local request.".to_string())?;
+
+        if let Some(previous_request) = cancellations.insert(request_id.clone(), abort_handle) {
+            previous_request.abort();
+        }
+    }
+
+    let result = Abortable::new(
+        ollama::stream_answer(request, on_token),
+        abort_registration,
+    )
+    .await;
+
+    if let Ok(mut cancellations) = request_state.cancellations.lock() {
+        cancellations.remove(&request_id);
+    }
+
+    match result {
+        Ok(stream_result) => stream_result,
+        Err(_) => Err("REQUEST_CANCELLED".to_string()),
+    }
+}
+
+#[tauri::command]
+fn cancel_ollama_request(
+    request_id: String,
+    request_state: State<'_, OllamaRequestState>,
+) -> Result<bool, String> {
+    let cancellation = request_state
+        .cancellations
+        .lock()
+        .map_err(|_| "Oz could not stop the local request.".to_string())?
+        .remove(&request_id);
+
+    if let Some(cancellation) = cancellation {
+        cancellation.abort();
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 #[tauri::command]
@@ -118,11 +178,13 @@ pub fn run() {
         .manage(PrivacyState {
             screen_context_enabled: AtomicBool::new(true),
         })
+        .manage(OllamaRequestState::default())
         .manage(voice::VoiceState::default())
         .invoke_handler(tauri::generate_handler![
             capture_active_display,
             get_ollama_status,
             ask_ollama,
+            cancel_ollama_request,
             get_voice_status,
             download_voice_model,
             list_microphones,
@@ -151,8 +213,7 @@ pub fn run() {
                     }
                     "disable" => {
                         let privacy = app.state::<PrivacyState>();
-                        let enabled =
-                            !privacy.screen_context_enabled.load(Ordering::Relaxed);
+                        let enabled = !privacy.screen_context_enabled.load(Ordering::Relaxed);
                         privacy
                             .screen_context_enabled
                             .store(enabled, Ordering::Relaxed);

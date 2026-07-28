@@ -11,11 +11,18 @@ const MAX_SCREEN_BASE64_LENGTH: usize = 40 * 1024 * 1024;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AskRequest {
+    request_id: String,
     question: String,
     model: String,
     screen: Option<ScreenInput>,
     #[serde(default)]
     history: Vec<ConversationMessage>,
+}
+
+impl AskRequest {
+    pub(crate) fn request_id(&self) -> &str {
+        &self.request_id
+    }
 }
 
 #[derive(Deserialize)]
@@ -118,6 +125,7 @@ pub async fn stream_answer(
     on_token: Channel<String>,
 ) -> Result<(), String> {
     let AskRequest {
+        request_id: _,
         question,
         model,
         screen,

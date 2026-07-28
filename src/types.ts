@@ -9,10 +9,17 @@ export type AssistantState =
 
 export type ChatRole = "user" | "assistant";
 
+export type ChatMessageStatus =
+  | "pending"
+  | "complete"
+  | "stopped"
+  | "error";
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
   content: string;
+  status?: ChatMessageStatus;
 }
 
 export interface ConversationMessage {
@@ -27,6 +34,7 @@ export interface ScreenContext {
 }
 
 export interface AskRequest {
+  requestId: string;
   question: string;
   history: ConversationMessage[];
   screen?: ScreenContext;
