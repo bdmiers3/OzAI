@@ -13,15 +13,16 @@
     "windows": [
       {
         "label": "main",
-        "title": "Oz",
+        "title": "OzAI",
         "width": 660,
         "height": 520,
         "resizable": false,
         "fullscreen": false,
         "decorations": false,
         "transparent": true,
-        "alwaysOnTop": true,
-        "center": true
+        "alwaysOnTop": false,
+        "center": true,
+        "shadow": false
       }
     ],
     "security": {

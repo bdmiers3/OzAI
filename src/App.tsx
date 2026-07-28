@@ -15,6 +15,7 @@ import type {
   VoiceStatus,
 } from "./types";
 
+const appWindow = getCurrentWindow();
 const MODEL = "qwen3-vl:8b";
 const DEMO_RESPONSE =
   "This browser preview demonstrates the Oz interface. Run “npm run tauri dev” to use native screen capture, local push-to-talk, and Qwen3-VL.";
@@ -288,11 +289,11 @@ export default function App() {
   }
 
   async function minimizeWindow() {
-    if (tauriRuntime) await getCurrentWindow().minimize();
+    if (tauriRuntime) await appWindow.minimize();
   }
 
-  async function hideWindow() {
-    if (tauriRuntime) await getCurrentWindow().hide();
+  async function closeWindow() {
+    if (tauriRuntime) await appWindow.close();
   }
 
   async function toggleScreenContext() {
@@ -366,7 +367,7 @@ export default function App() {
             >
               <span>—</span>
             </button>
-            <button className="icon-button" aria-label="Hide Oz" onClick={hideWindow}>
+            <button className="icon-button" aria-label="Close Oz" onClick={closeWindow}>
               <span>×</span>
             </button>
           </div>
