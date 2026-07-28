@@ -10,6 +10,8 @@ import { SystemSpeechSynthesizer } from "./services/speech/SystemSpeechSynthesiz
 import { TauriWhisperRecognizer } from "./services/speech/TauriWhisperRecognizer";
 import type {
   AssistantState,
+  ChatMessage,
+  ConversationMessage,
   MicrophoneDevice,
   VoiceDownloadProgress,
   VoiceStatus,
@@ -28,6 +30,25 @@ function errorMessage(error: unknown, fallback: string) {
   if (error instanceof Error) return error.message;
   if (typeof error === "string" && error.trim()) return error;
   return fallback;
+}
+
+function createMessageId() {
+  return typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random()}`;
+}
+
+function pendingLabel(state: AssistantState) {
+  switch (state) {
+    case "capturing":
+      return "Reading this screen…";
+    case "thinking":
+      return "Working on it…";
+    case "streaming":
+      return "Answering…";
+    default:
+      return "Preparing…";
+  }
 }
 
 function MicrophoneIcon() {
@@ -56,7 +77,7 @@ export default function App() {
   const speechSynthesizer = useMemo(() => new SystemSpeechSynthesizer(), []);
 
   const [question, setQuestion] = useState("");
-  const [answer, setAnswer] = useState("");
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [state, setState] = useState<AssistantState>("ready");
   const [status, setStatus] = useState("Checking local model…");
   const [modelAvailable, setModelAvailable] = useState(false);
@@ -76,9 +97,12 @@ export default function App() {
   const [voiceDownloading, setVoiceDownloading] = useState(false);
   const [voiceDownloadProgress, setVoiceDownloadProgress] =
     useState<VoiceDownloadProgress | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const conversationEndRef = useRef<HTMLDivElement>(null);
   const recordingRef = useRef(false);
   const startRecordingPromiseRef = useRef<Promise<void> | null>(null);
+
   const demoMode = !tauriRuntime;
   const busy =
     state === "listening" ||
@@ -113,6 +137,7 @@ export default function App() {
           message: errorMessage(error, "Oz could not check local voice."),
         }),
       );
+
     speechRecognizer
       .listMicrophones()
       .then((devices) => {
@@ -131,6 +156,7 @@ export default function App() {
     invoke<boolean>("get_screen_context_enabled")
       .then(setScreenEnabled)
       .catch(() => setScreenEnabled(false));
+
     const unlisten = listen<boolean>("screen-context-enabled", (event) => {
       setScreenEnabled(event.payload);
     });
@@ -151,21 +177,82 @@ export default function App() {
     }
   }, [selectedMicrophone]);
 
-  async function ask(prompt: string) {
-    try {
-      setAnswer("");
-      speechSynthesizer.cancel();
-      let completedAnswer = "";
+  useEffect(() => {
+    const input = inputRef.current;
+    if (!input) return;
 
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 92)}px`;
+  }, [question]);
+
+  useEffect(() => {
+    if (messages.length === 0 && state === "ready") return;
+
+    conversationEndRef.current?.scrollIntoView({
+      behavior: state === "streaming" ? "auto" : "smooth",
+      block: "end",
+    });
+  }, [messages, state]);
+
+  function setMessageContent(messageId: string, content: string) {
+    setMessages((current) =>
+      current.map((message) =>
+        message.id === messageId ? { ...message, content } : message,
+      ),
+    );
+  }
+
+  function appendAssistantMessage(content: string) {
+    setMessages((current) => [
+      ...current,
+      {
+        id: createMessageId(),
+        role: "assistant",
+        content,
+      },
+    ]);
+  }
+
+  async function ask(prompt: string) {
+    const trimmedPrompt = prompt.trim();
+    if (!trimmedPrompt) return;
+
+    const history: ConversationMessage[] = messages
+      .filter((message) => message.content.trim())
+      .map(({ role, content }) => ({ role, content }));
+
+    const userMessage: ChatMessage = {
+      id: createMessageId(),
+      role: "user",
+      content: trimmedPrompt,
+    };
+    const assistantMessageId = createMessageId();
+
+    setQuestion("");
+    setMessages((current) => [
+      ...current,
+      userMessage,
+      {
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
+      },
+    ]);
+    speechSynthesizer.cancel();
+
+    let completedAnswer = "";
+
+    try {
       if (demoMode) {
         if (screenEnabled) {
           setState("capturing");
           await new Promise((resolve) => window.setTimeout(resolve, 520));
         }
+
         setState("thinking");
         await new Promise((resolve) => window.setTimeout(resolve, 740));
         completedAnswer = DEMO_RESPONSE;
-        setAnswer(completedAnswer);
+        setMessageContent(assistantMessageId, completedAnswer);
       } else {
         if (!modelAvailable) throw new Error(status);
 
@@ -174,33 +261,46 @@ export default function App() {
           if (!captureProvider) {
             throw new Error("Native screen capture is unavailable.");
           }
+
           setState("capturing");
           screen = await captureProvider.captureActiveDisplay();
         }
 
         setState("thinking");
         let receivedToken = false;
+
         await provider.streamAnswer(
-          { question: prompt, model: MODEL, screen },
+          {
+            question: trimmedPrompt,
+            model: MODEL,
+            screen,
+            history,
+          },
           (token) => {
             receivedToken = true;
             completedAnswer += token;
             setState("streaming");
-            setAnswer((current) => current + token);
+            setMessageContent(assistantMessageId, completedAnswer);
           },
         );
+
         if (!receivedToken) {
           completedAnswer =
             "Oz completed the request but did not return a text response.";
-          setAnswer(completedAnswer);
+          setMessageContent(assistantMessageId, completedAnswer);
         }
       }
 
       setState("answer");
       if (spokenAnswers) speechSynthesizer.speak(completedAnswer);
     } catch (error) {
-      setAnswer(errorMessage(error, "Oz could not complete the request."));
+      setMessageContent(
+        assistantMessageId,
+        errorMessage(error, "Oz could not complete the request."),
+      );
       setState("answer");
+    } finally {
+      requestAnimationFrame(() => inputRef.current?.focus());
     }
   }
 
@@ -213,12 +313,14 @@ export default function App() {
 
   async function downloadVoiceModel() {
     if (!speechRecognizer || voiceDownloading) return;
+
     setVoiceDownloading(true);
     setVoiceDownloadProgress(null);
     setVoiceStatus((current) => ({
       ...current,
       message: "Downloading local voice model…",
     }));
+
     try {
       const installed = await speechRecognizer.downloadModel(
         setVoiceDownloadProgress,
@@ -237,19 +339,23 @@ export default function App() {
 
   async function startListening() {
     if (!speechRecognizer || !voiceStatus.available || busy) return;
+
     speechSynthesizer.cancel();
-    setAnswer("");
     setState("listening");
     recordingRef.current = true;
+
     const startPromise = speechRecognizer.startRecording(
       selectedMicrophone || undefined,
     );
     startRecordingPromiseRef.current = startPromise;
+
     try {
       await startPromise;
     } catch (error) {
       recordingRef.current = false;
-      setAnswer(errorMessage(error, "Oz could not start the microphone."));
+      appendAssistantMessage(
+        errorMessage(error, "Oz could not start the microphone."),
+      );
       setState("answer");
     } finally {
       if (startRecordingPromiseRef.current === startPromise) {
@@ -260,6 +366,7 @@ export default function App() {
 
   async function finishListening() {
     if (!speechRecognizer || !recordingRef.current) return;
+
     const pendingStart = startRecordingPromiseRef.current;
     if (pendingStart) {
       try {
@@ -268,14 +375,20 @@ export default function App() {
         return;
       }
     }
+
     recordingRef.current = false;
     setState("transcribing");
+
     try {
       const transcript = (await speechRecognizer.stopAndTranscribe()).trim();
-      setQuestion(transcript);
+      if (!transcript) {
+        throw new Error("Oz did not hear any speech.");
+      }
       await ask(transcript);
     } catch (error) {
-      setAnswer(errorMessage(error, "Oz could not transcribe the recording."));
+      appendAssistantMessage(
+        errorMessage(error, "Oz could not transcribe the recording."),
+      );
       setState("answer");
     }
   }
@@ -283,7 +396,7 @@ export default function App() {
   function reset() {
     speechSynthesizer.cancel();
     setQuestion("");
-    setAnswer("");
+    setMessages([]);
     setState("ready");
     requestAnimationFrame(() => inputRef.current?.focus());
   }
@@ -299,6 +412,7 @@ export default function App() {
   async function toggleScreenContext() {
     const enabled = !screenEnabled;
     setScreenEnabled(enabled);
+
     if (tauriRuntime) {
       try {
         await invoke("set_screen_context_enabled", { enabled });
@@ -327,14 +441,6 @@ export default function App() {
       title: "Transcribing locally",
       detail: "Whisper is turning your recording into text on this computer.",
     },
-    capturing: {
-      title: "Reading this screen",
-      detail: "A single screenshot is being captured.",
-    },
-    thinking: {
-      title: "Working on it",
-      detail: "Qwen3-VL is preparing a local response.",
-    },
   } as const;
 
   const setupProgress = voiceDownloadProgress?.percent != null
@@ -356,25 +462,46 @@ export default function App() {
           </div>
 
           <div className="window-actions">
+            {messages.length > 0 && (
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Start a new conversation"
+                title="New conversation"
+                onClick={reset}
+                disabled={busy}
+              >
+                <span>＋</span>
+              </button>
+            )}
+
             <span
               className={`privacy-dot${state === "listening" ? " is-listening" : screenEnabled ? " is-on" : ""}`}
               title={state === "listening" ? "Microphone active" : "Screen context"}
             />
+
             <button
+              type="button"
               className="icon-button"
               aria-label="Minimize"
               onClick={minimizeWindow}
             >
               <span>—</span>
             </button>
-            <button className="icon-button" aria-label="Close Oz" onClick={closeWindow}>
+
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Close Oz"
+              onClick={closeWindow}
+            >
               <span>×</span>
             </button>
           </div>
         </header>
 
         <div className="content">
-          {state === "ready" && (
+          {messages.length === 0 && state === "ready" && (
             <div className="welcome">
               <p className="eyebrow">SCREEN-AWARE ASSISTANT</p>
               <h2>What are you looking at?</h2>
@@ -383,46 +510,80 @@ export default function App() {
                 voice processing stay on this computer.
               </p>
               <div className="suggestions">
-                <button onClick={() => setQuestion("What is causing this error?")}>
+                <button
+                  type="button"
+                  onClick={() => void ask("What is causing this error?")}
+                >
                   Explain this error
                 </button>
-                <button onClick={() => setQuestion("Summarize what is on my screen.")}>
+                <button
+                  type="button"
+                  onClick={() => void ask("Summarize what is on my screen.")}
+                >
                   Summarize my screen
                 </button>
-                <button onClick={() => setQuestion("What should I do next here?")}>
+                <button
+                  type="button"
+                  onClick={() => void ask("What should I do next here?")}
+                >
                   Suggest the next step
                 </button>
               </div>
             </div>
           )}
 
-          {(state === "listening" ||
-            state === "transcribing" ||
-            state === "capturing" ||
-            state === "thinking") && (
-            <div className={`processing processing--${state}`}>
-              <OzMark active />
-              <div className="pulse-line">
-                <span />
-                <span />
-                <span />
-                <span />
-                <span />
+          {messages.length === 0 &&
+            (state === "listening" || state === "transcribing") && (
+              <div className={`processing processing--${state}`}>
+                <OzMark active />
+                <div className="pulse-line">
+                  <span />
+                  <span />
+                  <span />
+                  <span />
+                  <span />
+                </div>
+                <h2>{processingCopy[state].title}</h2>
+                <p>{processingCopy[state].detail}</p>
               </div>
-              <h2>{processingCopy[state].title}</h2>
-              <p>{processingCopy[state].detail}</p>
-            </div>
-          )}
+            )}
 
-          {(state === "streaming" || state === "answer") && (
-            <div className="response">
-              <p className="eyebrow">OZ</p>
-              <p>{answer}</p>
-              {state === "answer" && (
-                <button className="new-question" onClick={reset}>
-                  Ask another question
-                </button>
-              )}
+          {messages.length > 0 && (
+            <div className="conversation">
+              {messages.map((message, index) => {
+                const isLastMessage = index === messages.length - 1;
+                const isPending =
+                  message.role === "assistant" &&
+                  !message.content &&
+                  isLastMessage &&
+                  busy;
+
+                return (
+                  <article
+                    key={message.id}
+                    className={`message-row message-row--${message.role}`}
+                  >
+                    <span className="message-author">
+                      {message.role === "user" ? "YOU" : "OZ"}
+                    </span>
+                    <div className="message-bubble">
+                      {isPending ? (
+                        <div className="message-pending">
+                          <span className="message-pending__dots" aria-hidden="true">
+                            <i />
+                            <i />
+                            <i />
+                          </span>
+                          <span>{pendingLabel(state)}</span>
+                        </div>
+                      ) : (
+                        <p>{message.content}</p>
+                      )}
+                    </div>
+                  </article>
+                );
+              })}
+              <div ref={conversationEndRef} />
             </div>
           )}
         </div>
@@ -485,10 +646,18 @@ export default function App() {
             >
               <MicrophoneIcon />
             </button>
-            <input
+
+            <textarea
               ref={inputRef}
+              rows={1}
               value={question}
               onChange={(event) => setQuestion(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  event.currentTarget.form?.requestSubmit();
+                }
+              }}
               placeholder={
                 state === "listening"
                   ? "Listening… release to send"
@@ -497,6 +666,7 @@ export default function App() {
               aria-label="Question for Oz"
               disabled={busy}
             />
+
             <button
               type="button"
               className={`context-toggle${screenEnabled ? " is-on" : ""}`}
@@ -507,6 +677,7 @@ export default function App() {
               <span className="screen-icon">▣</span>
               Screen
             </button>
+
             <button
               className="send-button"
               disabled={!question.trim() || busy}
@@ -522,6 +693,7 @@ export default function App() {
             className={`status-dot${!demoMode && modelAvailable ? " is-connected" : ""}`}
           />
           <span>{demoMode ? "Browser preview" : status}</span>
+
           {tauriRuntime && voiceStatus.available && (
             <details className="voice-settings">
               <summary>Voice</summary>
@@ -553,6 +725,7 @@ export default function App() {
               </div>
             </details>
           )}
+
           <span className="shortcut">Ctrl&nbsp; Shift&nbsp; Space</span>
         </footer>
       </section>

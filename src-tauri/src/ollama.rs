@@ -4,6 +4,8 @@ use tauri::ipc::Channel;
 
 const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 const MAX_QUESTION_LENGTH: usize = 8_000;
+const MAX_HISTORY_MESSAGES: usize = 24;
+const MAX_HISTORY_MESSAGE_LENGTH: usize = 16_000;
 const MAX_SCREEN_BASE64_LENGTH: usize = 40 * 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -12,6 +14,14 @@ pub struct AskRequest {
     question: String,
     model: String,
     screen: Option<ScreenInput>,
+    #[serde(default)]
+    history: Vec<ConversationMessage>,
+}
+
+#[derive(Deserialize)]
+struct ConversationMessage {
+    role: String,
+    content: String,
 }
 
 #[derive(Deserialize)]
@@ -84,6 +94,7 @@ pub async fn get_status(model: String) -> ModelStatus {
         Ok(tags) => tags,
         Err(_) => return unavailable(model, "Ollama returned an unreadable model list."),
     };
+
     let installed = tags.models.iter().any(|candidate| {
         candidate.name == model || candidate.name == format!("{model}:latest")
     });
@@ -106,18 +117,25 @@ pub async fn stream_answer(
     request: AskRequest,
     on_token: Channel<String>,
 ) -> Result<(), String> {
-    let question = request.question.trim();
+    let AskRequest {
+        question,
+        model,
+        screen,
+        history,
+    } = request;
+
+    let question = question.trim().to_string();
     if question.is_empty() {
         return Err("Enter a question for Oz.".to_string());
     }
     if question.len() > MAX_QUESTION_LENGTH {
         return Err("That question is too long for this version of Oz.".to_string());
     }
-    if request.model.trim().is_empty() {
+    if model.trim().is_empty() {
         return Err("No local model is selected.".to_string());
     }
 
-    let images = match request.screen {
+    let images = match screen {
         Some(screen) => {
             if screen.base64_png.len() > MAX_SCREEN_BASE64_LENGTH {
                 return Err("The screenshot is too large to process safely.".to_string());
@@ -140,18 +158,38 @@ pub async fn stream_answer(
         })
     };
 
+    let history_start = history.len().saturating_sub(MAX_HISTORY_MESSAGES);
+    let mut messages = Vec::with_capacity(history.len().min(MAX_HISTORY_MESSAGES) + 2);
+    messages.push(serde_json::json!({
+        "role": "system",
+        "content": "You are Oz, a concise desktop assistant. Use the supplied screenshot when relevant. Never claim to see details that are not visible. When explaining an interface, give clear, actionable steps."
+    }));
+
+    for message in history.into_iter().skip(history_start) {
+        let role = message.role.trim();
+        let content = message.content.trim();
+
+        if (role != "user" && role != "assistant")
+            || content.is_empty()
+            || content.len() > MAX_HISTORY_MESSAGE_LENGTH
+        {
+            continue;
+        }
+
+        messages.push(serde_json::json!({
+            "role": role,
+            "content": content
+        }));
+    }
+
+    messages.push(user_message);
+
     let body = serde_json::json!({
-        "model": request.model,
+        "model": model,
         "stream": true,
         "think": false,
         "keep_alive": "5m",
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are Oz, a concise desktop assistant. Use the supplied screenshot when relevant. Never claim to see details that are not visible. When explaining an interface, give clear, actionable steps."
-            },
-            user_message
-        ]
+        "messages": messages
     });
 
     let client = reqwest::Client::builder()
@@ -209,9 +247,11 @@ fn send_stream_line(line: &[u8], on_token: &Channel<String>) -> Result<(), Strin
 
     let chunk = serde_json::from_slice::<StreamChunk>(line)
         .map_err(|error| format!("Ollama returned an unreadable response: {error}"))?;
+
     if let Some(error) = chunk.error {
         return Err(error);
     }
+
     if let Some(content) = chunk.message.and_then(|message| message.content) {
         if !content.is_empty() {
             on_token
@@ -219,6 +259,7 @@ fn send_stream_line(line: &[u8], on_token: &Channel<String>) -> Result<(), Strin
                 .map_err(|error| format!("Oz could not display the response: {error}"))?;
         }
     }
+
     Ok(())
 }
 

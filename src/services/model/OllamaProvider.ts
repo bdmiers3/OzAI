@@ -52,12 +52,14 @@ export class OllamaProvider implements ModelProvider {
       body: JSON.stringify({
         model: request.model,
         stream: true,
+        think: false,
         messages: [
           {
             role: "system",
             content:
-              "You are Oz, a concise desktop assistant. Use the supplied screenshot when relevant. Never claim to see details that are not visible.",
+              "You are Oz, a concise desktop assistant. Use the supplied screenshot when relevant. Never claim to see details that are not visible. When explaining an interface, give clear, actionable steps.",
           },
+          ...request.history.map(({ role, content }) => ({ role, content })),
           {
             role: "user",
             content: request.question,
@@ -78,8 +80,8 @@ export class OllamaProvider implements ModelProvider {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
 
+      buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
 

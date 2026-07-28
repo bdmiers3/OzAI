@@ -7,6 +7,19 @@ export type AssistantState =
   | "streaming"
   | "answer";
 
+export type ChatRole = "user" | "assistant";
+
+export interface ChatMessage {
+  id: string;
+  role: ChatRole;
+  content: string;
+}
+
+export interface ConversationMessage {
+  role: ChatRole;
+  content: string;
+}
+
 export interface ScreenContext {
   base64Png: string;
   capturedAt: string;
@@ -15,6 +28,7 @@ export interface ScreenContext {
 
 export interface AskRequest {
   question: string;
+  history: ConversationMessage[];
   screen?: ScreenContext;
   model: string;
 }
