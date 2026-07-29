@@ -3,19 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { OzMark } from "./components/OzMark";
-import { HistoryDrawer } from "./components/HistoryDrawer";
 import { TauriScreenCaptureProvider } from "./services/capture/TauriScreenCaptureProvider";
 import { OllamaProvider } from "./services/model/OllamaProvider";
 import { TauriOllamaProvider } from "./services/model/TauriOllamaProvider";
 import { SystemSpeechSynthesizer } from "./services/speech/SystemSpeechSynthesizer";
 import { TauriWhisperRecognizer } from "./services/speech/TauriWhisperRecognizer";
-import {
-  createConversationId,
-  loadConversationState,
-  saveActiveConversationId,
-  saveConversations,
-  upsertConversation,
-} from "./services/conversations/conversationStore";
 import type {
   AssistantState,
   ChatMessage,
@@ -225,23 +217,11 @@ export default function App() {
     [tauriRuntime],
   );
   const speechSynthesizer = useMemo(() => new SystemSpeechSynthesizer(), []);
-  const initialConversationState = useMemo(() => loadConversationState(), []);
 
   const [question, setQuestion] = useState("");
-  const [messages, setMessages] = useState<ChatMessage[]>(
-    initialConversationState.messages,
-  );
-  const [conversations, setConversations] = useState(
-    initialConversationState.conversations,
-  );
-  const [activeConversationId, setActiveConversationId] = useState<string | null>(
-    initialConversationState.activeConversationId,
-  );
-  const [historyOpen, setHistoryOpen] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
-  const [state, setState] = useState<AssistantState>(() =>
-    initialConversationState.messages.length > 0 ? "answer" : "ready",
-  );
+  const [state, setState] = useState<AssistantState>("ready");
   const [status, setStatus] = useState("Checking local model…");
   const [modelAvailable, setModelAvailable] = useState(false);
   const [screenEnabled, setScreenEnabled] = useState(true);
@@ -354,45 +334,6 @@ export default function App() {
       window.localStorage.setItem("oz.microphone", selectedMicrophone);
     }
   }, [selectedMicrophone]);
-
-  useEffect(() => {
-    saveActiveConversationId(activeConversationId);
-  }, [activeConversationId]);
-
-  useEffect(() => {
-    if (!activeConversationId || messages.length === 0) return;
-
-    const saveTimer = window.setTimeout(() => {
-      setConversations((current) => {
-        const next = upsertConversation(
-          current,
-          activeConversationId,
-          messages,
-        );
-        if (next === current) return current;
-        saveConversations(next);
-        return next;
-      });
-    }, 180);
-
-    return () => window.clearTimeout(saveTimer);
-  }, [activeConversationId, messages]);
-
-  useEffect(() => {
-    function flushConversationHistory() {
-      const next = upsertConversation(
-        conversations,
-        activeConversationId,
-        messages,
-      );
-      saveConversations(next);
-      saveActiveConversationId(activeConversationId);
-    }
-
-    window.addEventListener("pagehide", flushConversationHistory);
-    return () =>
-      window.removeEventListener("pagehide", flushConversationHistory);
-  }, [activeConversationId, conversations, messages]);
 
   useEffect(() => {
     const input = inputRef.current;
@@ -599,14 +540,9 @@ export default function App() {
   }
 
   async function ask(prompt: string, allowWhileBusy = false) {
-    const trimmedPrompt = prompt.trim();
-    if (!trimmedPrompt || (busy && !allowWhileBusy)) return;
+  const trimmedPrompt = prompt.trim();
 
-    if (!activeConversationId) {
-      const conversationId = createConversationId();
-      setActiveConversationId(conversationId);
-      saveActiveConversationId(conversationId);
-    }
+  if (!trimmedPrompt || (busy && !allowWhileBusy)) return;
 
     const history = buildHistory(messages);
     const userMessage: ChatMessage = {
@@ -785,78 +721,9 @@ export default function App() {
     speechSynthesizer.cancel();
     setQuestion("");
     setMessages([]);
-    setActiveConversationId(null);
-    saveActiveConversationId(null);
-    setHistoryOpen(false);
     setCopiedMessageId(null);
     setState("ready");
     requestAnimationFrame(() => inputRef.current?.focus());
-  }
-
-  function openConversation(conversationId: string) {
-    if (busy) return;
-
-    const conversation = conversations.find(
-      (candidate) => candidate.id === conversationId,
-    );
-    if (!conversation) return;
-
-    speechSynthesizer.cancel();
-    setActiveConversationId(conversation.id);
-    saveActiveConversationId(conversation.id);
-    setMessages(conversation.messages.map((message) => ({ ...message })));
-    setQuestion("");
-    setCopiedMessageId(null);
-    setState(conversation.messages.length > 0 ? "answer" : "ready");
-    setHistoryOpen(false);
-    requestAnimationFrame(() => inputRef.current?.focus());
-  }
-
-  function renameConversation(conversationId: string, title: string) {
-    const normalizedTitle = title.replace(/\s+/g, " ").trim().slice(0, 80);
-    if (!normalizedTitle) return;
-
-    setConversations((current) => {
-      const next = current.map((conversation) =>
-        conversation.id === conversationId
-          ? {
-              ...conversation,
-              title: normalizedTitle,
-              titleEdited: true,
-            }
-          : conversation,
-      );
-      saveConversations(next);
-      return next;
-    });
-  }
-
-  function deleteConversation(conversationId: string) {
-    if (busy) return;
-
-    const conversation = conversations.find(
-      (candidate) => candidate.id === conversationId,
-    );
-    if (!conversation) return;
-
-    if (!window.confirm(`Delete “${conversation.title}”?`)) return;
-
-    const next = conversations.filter(
-      (candidate) => candidate.id !== conversationId,
-    );
-    setConversations(next);
-    saveConversations(next);
-
-    if (conversationId === activeConversationId) reset();
-  }
-
-  function clearConversationHistory() {
-    if (busy || conversations.length === 0) return;
-    if (!window.confirm("Delete all saved Oz conversations?")) return;
-
-    setConversations([]);
-    saveConversations([]);
-    reset();
   }
 
   async function minimizeWindow() {
@@ -1006,18 +873,6 @@ export default function App() {
           </div>
 
           <div className="window-actions">
-            <button
-              type="button"
-              className="icon-button history-trigger"
-              aria-label="Open conversation history"
-              title="Conversation history"
-              aria-expanded={historyOpen}
-              onClick={() => setHistoryOpen(true)}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M5 6h14M5 12h14M5 18h9" />
-              </svg>
-            </button>
             {messages.length > 0 && (
               <button
                 type="button"
@@ -1055,18 +910,7 @@ export default function App() {
             </button>
           </div>
         </header>
-        <HistoryDrawer
-          open={historyOpen}
-          conversations={conversations}
-          activeConversationId={activeConversationId}
-          disabled={busy}
-          onClose={() => setHistoryOpen(false)}
-          onNewConversation={reset}
-          onOpenConversation={openConversation}
-          onRenameConversation={renameConversation}
-          onDeleteConversation={deleteConversation}
-          onClearHistory={clearConversationHistory}
-        />
+
         <div className="content">
           {messages.length === 0 && state === "ready" && (
             <div className="welcome">
