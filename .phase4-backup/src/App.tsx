@@ -32,117 +32,6 @@ function errorMessage(error: unknown, fallback: string) {
   return fallback;
 }
 
-// ===== PHASE 4: STATUS AND ERROR PRESENTATION =====
-type StatusTone = "ready" | "working" | "listening" | "warning" | "error";
-
-interface FriendlyError {
-  title: string;
-  detail: string;
-  hint: string;
-}
-
-function friendlyError(message: string): FriendlyError {
-  const detail = message.trim() || "Oz could not complete the request.";
-  const normalized = detail.toLowerCase();
-
-  if (
-    normalized.includes("ollama is not connected") ||
-    normalized.includes("could not reach ollama") ||
-    normalized.includes("connection refused") ||
-    normalized.includes("failed to connect")
-  ) {
-    return {
-      title: "Ollama isn’t running",
-      detail: "Oz couldn’t connect to the local AI service.",
-      hint: "Open the Ollama app, wait a moment, then select Retry.",
-    };
-  }
-
-  if (
-    (normalized.includes("model") && normalized.includes("not installed")) ||
-    normalized.includes("no local model is selected")
-  ) {
-    return {
-      title: "Local model not installed",
-      detail,
-      hint: "Run “ollama pull qwen3-vl:8b” in a terminal, then select Check again.",
-    };
-  }
-
-  if (
-    normalized.includes("screen capture") ||
-    normalized.includes("capture task") ||
-    normalized.includes("could not hide its overlay") ||
-    normalized.includes("screenshot")
-  ) {
-    return {
-      title: "Screen capture failed",
-      detail,
-      hint: "Try again, or turn Screen off to send the prompt without a screenshot.",
-    };
-  }
-
-  if (
-    normalized.includes("microphone") ||
-    normalized.includes("start the recording") ||
-    normalized.includes("audio device")
-  ) {
-    return {
-      title: "Microphone unavailable",
-      detail,
-      hint: "Check Windows microphone permission and the selected device in Voice settings.",
-    };
-  }
-
-  if (
-    normalized.includes("whisper") ||
-    normalized.includes("transcrib") ||
-    normalized.includes("did not hear any speech")
-  ) {
-    return {
-      title: "Voice transcription failed",
-      detail,
-      hint: "Hold the microphone while speaking clearly, then release it to send.",
-    };
-  }
-
-  if (normalized.includes("timed out") || normalized.includes("timeout")) {
-    return {
-      title: "The request timed out",
-      detail,
-      hint: "Retry the request. A shorter prompt or smaller screen image may finish faster.",
-    };
-  }
-
-  if (
-    normalized.includes("response stream stopped") ||
-    normalized.includes("unreadable response")
-  ) {
-    return {
-      title: "The local response was interrupted",
-      detail,
-      hint: "Retry the request. Restart Ollama if this continues.",
-    };
-  }
-
-  if (
-    normalized.includes("did not return a text response") ||
-    normalized.includes("empty response")
-  ) {
-    return {
-      title: "Oz returned an empty response",
-      detail,
-      hint: "Retry the request or rephrase the prompt.",
-    };
-  }
-
-  return {
-    title: "Oz couldn’t complete that",
-    detail,
-    hint: "Retry the request. If it happens again, check the terminal for more detail.",
-  };
-}
-
 function createMessageId() {
   return typeof crypto.randomUUID === "function"
     ? crypto.randomUUID()
@@ -183,11 +72,11 @@ function abortableDelay(milliseconds: number, signal: AbortSignal) {
 function pendingLabel(state: AssistantState) {
   switch (state) {
     case "capturing":
-      return "Reading your screen…";
+      return "Reading this screen…";
     case "thinking":
-      return "Thinking locally…";
+      return "Working on it…";
     case "streaming":
-      return "Writing response…";
+      return "Answering…";
     default:
       return "Preparing…";
   }
@@ -251,35 +140,25 @@ export default function App() {
 
   const demoMode = !tauriRuntime;
   const generating =
-    state === "capturing" || state === "thinking" || state === "streaming";  const busy =
+    state === "capturing" || state === "thinking" || state === "streaming";
+  const busy =
     state === "listening" ||
     state === "transcribing" ||
     state === "capturing" ||
     state === "thinking" ||
     state === "streaming";
 
-  async function refreshModelStatus() {
-    setStatus("Checking local model…");
-
-    try {
-      const result = await provider.getStatus(MODEL);
-      setStatus(result.message);
-      setModelAvailable(result.available);
-      return result;
-    } catch (error) {
-      const message = errorMessage(error, "Oz could not check the local model.");
-      setStatus(message);
-      setModelAvailable(false);
-      return {
-        available: false,
-        model: MODEL,
-        message,
-      };
-    }
-  }
-
   useEffect(() => {
-    void refreshModelStatus();
+    provider
+      .getStatus(MODEL)
+      .then((result) => {
+        setStatus(result.message);
+        setModelAvailable(result.available);
+      })
+      .catch((error) => {
+        setStatus(errorMessage(error, "Oz could not check the local model."));
+        setModelAvailable(false);
+      });
   }, [provider]);
 
   useEffect(() => {
@@ -435,12 +314,8 @@ export default function App() {
           content: completedAnswer,
           status: "complete",
         });
-      } else {        if (!modelAvailable) {
-          const currentModelStatus = await refreshModelStatus();
-          if (!currentModelStatus.available) {
-            throw new Error(currentModelStatus.message);
-          }
-        }
+      } else {
+        if (!modelAvailable) throw new Error(status);
 
         let screen;
         if (screenEnabled) {
@@ -483,10 +358,11 @@ export default function App() {
           controller.signal,
         );
 
-        if (controller.signal.aborted) throw cancelledError();        if (!receivedToken) {
-          throw new Error(
-            "Oz completed the request but did not return a text response.",
-          );
+        if (controller.signal.aborted) throw cancelledError();
+
+        if (!receivedToken) {
+          completedAnswer =
+            "Oz completed the request but did not return a text response.";
         }
 
         updateMessage(assistantMessageId, {
@@ -506,23 +382,10 @@ export default function App() {
         updateMessage(assistantMessageId, {
           content: completedAnswer || "Response stopped.",
           status: "stopped",
-        });      } else {
-        const failureMessage = errorMessage(
-          error,
-          "Oz could not complete the request.",
-        );
-        const normalizedFailure = failureMessage.toLowerCase();
-
-        if (
-          normalizedFailure.includes("ollama") ||
-          normalizedFailure.includes("local model")
-        ) {
-          setModelAvailable(false);
-          setStatus(failureMessage);
-        }
-
+        });
+      } else {
         updateMessage(assistantMessageId, {
-          content: failureMessage,
+          content: errorMessage(error, "Oz could not complete the request."),
           status: "error",
         });
       }
@@ -745,98 +608,25 @@ export default function App() {
         setScreenEnabled(!enabled);
       }
     }
-  }  const latestAssistant = [...messages]
+  }
+
+  const latestAssistant = [...messages]
     .reverse()
     .find((message) => message.role === "assistant");
-  const latestError =
-    latestAssistant?.status === "error"
-      ? friendlyError(latestAssistant.content)
-      : null;
-  const headerStatus: {
-    label: string;
-    detail: string;
-    tone: StatusTone;
-  } = (() => {
-    switch (state) {
-      case "listening":
-        return {
-          label: "Listening",
-          detail: "Release the microphone button to transcribe and send.",
-          tone: "listening",
-        };
-      case "transcribing":
-        return {
-          label: "Transcribing locally",
-          detail: "Whisper is processing the recording on this computer.",
-          tone: "working",
-        };
-      case "capturing":
-        return {
-          label: "Reading screen",
-          detail: "Oz is capturing the display under your cursor.",
-          tone: "working",
-        };
-      case "thinking":
-        return {
-          label: "Thinking locally",
-          detail: "The local model is preparing a response.",
-          tone: "working",
-        };
-      case "streaming":
-        return {
-          label: "Answering locally",
-          detail: "Oz is streaming the response from the local model.",
-          tone: "working",
-        };
-      case "answer":
-        if (latestAssistant?.status === "error") {
-          return {
-            label: latestError?.title ?? "Needs attention",
-            detail: latestError?.hint ?? latestAssistant.content,
-            tone: "error",
-          };
-        }
-        if (latestAssistant?.status === "stopped") {
-          return {
-            label: "Response stopped",
-            detail: "The partial response was kept. Select Retry to regenerate it.",
-            tone: "warning",
-          };
-        }
-        return {
-          label: "Response ready",
-          detail: "Oz finished the local response.",
-          tone: "ready",
-        };
-      default:
-        if (demoMode) {
-          return {
-            label: "Browser preview",
-            detail: "Native capture and local voice require the Tauri desktop app.",
-            tone: "warning",
-          };
-        }
-        if (status.toLowerCase().includes("checking")) {
-          return {
-            label: "Checking local model",
-            detail: status,
-            tone: "working",
-          };
-        }
-        if (!modelAvailable) {
-          return {
-            label: "Local model unavailable",
-            detail: status,
-            tone: "warning",
-          };
-        }
-        return {
-          label: "Ready",
-          detail: status,
-          tone: "ready",
-        };
-    }
-  })();
+  const stateLabel = {
+    ready: "Ready",
+    listening: "Listening",
+    transcribing: "Transcribing locally",
+    capturing: "Capturing screen",
+    thinking: "Thinking locally",
+    streaming: "Answering locally",
+    answer:
+      latestAssistant?.status === "stopped"
+        ? "Response stopped"
+        : latestAssistant?.status === "error"
+          ? "Needs attention"
+          : "Response ready",
+  }[state];
 
   const processingCopy = {
     listening: {
@@ -861,14 +651,9 @@ export default function App() {
         <header className="topbar" data-tauri-drag-region>
           <div className="brand" data-tauri-drag-region>
             <OzMark active={busy} />
-            <div>              <h1>Oz</h1>
-              <p
-                className={`header-status header-status--${headerStatus.tone}`}
-                title={headerStatus.detail}
-              >
-                <span className="header-status__dot" aria-hidden="true" />
-                {headerStatus.label}
-              </p>
+            <div>
+              <h1>Oz</h1>
+              <p>{stateLabel}</p>
             </div>
           </div>
 
@@ -962,19 +747,13 @@ export default function App() {
           {messages.length > 0 && (
             <div className="conversation">
               {messages.map((message, index) => {
-                const isLastMessage = index === messages.length - 1;                const isPending =
+                const isLastMessage = index === messages.length - 1;
+                const isPending =
                   message.role === "assistant" &&
                   !message.content &&
                   isLastMessage &&
                   busy;
-                const errorDetails =
-                  message.status === "error"
-                    ? friendlyError(message.content)
-                    : null;
-                const canRetry =
-                  isLastMessage &&
-                  index > 0 &&
-                  messages[index - 1]?.role === "user";
+
                 return (
                   <article
                     key={message.id}
@@ -1000,16 +779,6 @@ export default function App() {
                             <i />
                           </span>
                           <span>{pendingLabel(state)}</span>
-                        </div>                      ) : errorDetails ? (
-                        <div className="message-error" role="alert">
-                          <span className="message-error__icon" aria-hidden="true">
-                            !
-                          </span>
-                          <div className="message-error__copy">
-                            <strong>{errorDetails.title}</strong>
-                            <p>{errorDetails.detail}</p>
-                            <span>{errorDetails.hint}</span>
-                          </div>
                         </div>
                       ) : (
                         <p>{message.content}</p>
@@ -1037,7 +806,8 @@ export default function App() {
                             }
                           >
                             {copiedMessageId === message.id ? "Copied" : "Copy"}
-                          </button>                          {canRetry && (
+                          </button>
+                          {isLastMessage && (
                             <button
                               type="button"
                               onClick={() => void retryMessage(message.id)}
@@ -1125,12 +895,11 @@ export default function App() {
                   event.preventDefault();
                   event.currentTarget.form?.requestSubmit();
                 }
-              }}              placeholder={
+              }}
+              placeholder={
                 state === "listening"
                   ? "Listening… release to send"
-                  : screenEnabled
-                    ? "Ask about what’s on your screen…"
-                    : "Ask Oz anything…"
+                  : "Ask about what’s on your screen…"
               }
               aria-label="Question for Oz"
               disabled={busy}
@@ -1167,28 +936,13 @@ export default function App() {
               </button>
             )}
           </form>
-        </div>        <footer>
+        </div>
+
+        <footer>
           <span
-            className={`status-dot${
-              !demoMode && modelAvailable
-                ? " is-connected"
-                : status.toLowerCase().includes("checking")
-                  ? " is-checking"
-                  : " is-error"
-            }`}
+            className={`status-dot${!demoMode && modelAvailable ? " is-connected" : ""}`}
           />
-          <span className="footer-status-text">
-            {demoMode ? "Browser preview" : status}
-          </span>
-          {tauriRuntime && !modelAvailable && !busy && (
-            <button
-              type="button"
-              className="status-recheck"
-              onClick={() => void refreshModelStatus()}
-            >
-              Check again
-            </button>
-          )}
+          <span>{demoMode ? "Browser preview" : status}</span>
 
           {tauriRuntime && voiceStatus.available && (
             <details className="voice-settings">
