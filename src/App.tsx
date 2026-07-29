@@ -402,9 +402,10 @@ export default function App() {
     }
   }
 
-  async function ask(prompt: string) {
-    const trimmedPrompt = prompt.trim();
-    if (!trimmedPrompt || busy) return;
+  async function ask(prompt: string, allowWhileBusy = false) {
+  const trimmedPrompt = prompt.trim();
+
+  if (!trimmedPrompt || (busy && !allowWhileBusy)) return;
 
     const history = buildHistory(messages);
     const userMessage: ChatMessage = {
@@ -569,7 +570,7 @@ export default function App() {
       if (!transcript) {
         throw new Error("Oz did not hear any speech.");
       }
-      await ask(transcript);
+      await ask(transcript, true);
     } catch (error) {
       appendAssistantMessage(
         errorMessage(error, "Oz could not transcribe the recording."),
