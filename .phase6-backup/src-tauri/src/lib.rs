@@ -17,6 +17,7 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, State, WebviewWindow,
 };
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -174,10 +175,6 @@ fn set_screen_context_enabled(enabled: bool, privacy: State<'_, PrivacyState>) -
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
-        ))
         .manage(PrivacyState {
             screen_context_enabled: AtomicBool::new(true),
         })
@@ -226,6 +223,24 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
+
+            let shortcut = Shortcut::new(
+                Some(Modifiers::CONTROL | Modifiers::SHIFT),
+                Code::Space,
+            );
+            app.global_shortcut().on_shortcut(shortcut, |app, _, event| {
+                if event.state == ShortcutState::Pressed {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let visible = window.is_visible().unwrap_or(false);
+                        if visible {
+                            let _ = window.hide();
+                        } else {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                }
+            })?;
 
             Ok(())
         })

@@ -21,7 +21,6 @@ serde_json = "1"
 sha1 = "0.10"
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-global-shortcut = "2"
-tauri-plugin-autostart = "2"
 whisper-rs = "=0.16.0"
 
 [target.'cfg(windows)'.dependencies]

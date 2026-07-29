@@ -1,12 +1,9 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow, PhysicalPosition } from "@tauri-apps/api/window";
-import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from "@tauri-apps/plugin-autostart";
-import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { OzMark } from "./components/OzMark";
 import { HistoryDrawer } from "./components/HistoryDrawer";
-import { SettingsDrawer } from "./components/SettingsDrawer";
 import { TauriScreenCaptureProvider } from "./services/capture/TauriScreenCaptureProvider";
 import { OllamaProvider } from "./services/model/OllamaProvider";
 import { TauriOllamaProvider } from "./services/model/TauriOllamaProvider";
@@ -19,13 +16,6 @@ import {
   saveConversations,
   upsertConversation,
 } from "./services/conversations/conversationStore";
-import {
-  loadOzSettings,
-  loadWindowPosition,
-  saveOzSettings,
-  saveWindowPosition,
-  type OzSettings,
-} from "./services/settings/settingsStore";
 import type {
   AssistantState,
   ChatMessage,
@@ -36,6 +26,7 @@ import type {
 } from "./types";
 
 const appWindow = getCurrentWindow();
+const MODEL = "qwen3-vl:8b";
 const DEMO_RESPONSE =
   "This browser preview demonstrates the Oz interface. Run “npm run tauri dev” to use native screen capture, local push-to-talk, and Qwen3-VL.";
 
@@ -82,7 +73,7 @@ function friendlyError(message: string): FriendlyError {
     return {
       title: "Local model not installed",
       detail,
-      hint: "Install the selected model in Ollama, then select Check again.",
+      hint: "Run “ollama pull qwen3-vl:8b” in a terminal, then select Check again.",
     };
   }
 
@@ -210,14 +201,6 @@ function pendingLabel(state: AssistantState) {
   }
 }
 
-// ===== PHASE 6: SETTINGS INTEGRATION =====
-function shortcutLabel(shortcut: string) {
-  if (shortcut === "disabled") return "Shortcut off";
-  return shortcut
-    .replace("CommandOrControl", "Ctrl")
-    .replaceAll("+", " · ");
-}
-
 function MicrophoneIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -243,7 +226,6 @@ export default function App() {
   );
   const speechSynthesizer = useMemo(() => new SystemSpeechSynthesizer(), []);
   const initialConversationState = useMemo(() => loadConversationState(), []);
-  const initialSettings = useMemo(() => loadOzSettings(), []);
 
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>(
@@ -256,17 +238,13 @@ export default function App() {
     initialConversationState.activeConversationId,
   );
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [appSettings, setAppSettings] = useState<OzSettings>(initialSettings);
-  const [launchAtStartup, setLaunchAtStartup] = useState(false);
-  const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [state, setState] = useState<AssistantState>(() =>
     initialConversationState.messages.length > 0 ? "answer" : "ready",
   );
   const [status, setStatus] = useState("Checking local model…");
   const [modelAvailable, setModelAvailable] = useState(false);
-  const [screenEnabled, setScreenEnabled] = useState(initialSettings.screenEnabled);
+  const [screenEnabled, setScreenEnabled] = useState(true);
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>({
     available: false,
     modelName: "Whisper base.en",
@@ -274,10 +252,10 @@ export default function App() {
   });
   const [microphones, setMicrophones] = useState<MicrophoneDevice[]>([]);
   const [selectedMicrophone, setSelectedMicrophone] = useState(
-    initialSettings.selectedMicrophone,
+    () => window.localStorage.getItem("oz.microphone") ?? "",
   );
   const [spokenAnswers, setSpokenAnswers] = useState(
-    initialSettings.spokenAnswers,
+    () => window.localStorage.getItem("oz.spokenAnswers") === "true",
   );
   const [voiceDownloading, setVoiceDownloading] = useState(false);
   const [voiceDownloadProgress, setVoiceDownloadProgress] =
@@ -290,10 +268,8 @@ export default function App() {
   const copiedResetTimeoutRef = useRef<number | null>(null);
   const recordingRef = useRef(false);
   const startRecordingPromiseRef = useRef<Promise<void> | null>(null);
-  const activeShortcutRef = useRef<string | null>(null);
 
   const demoMode = !tauriRuntime;
-  const selectedModel = appSettings.model;
   const generating =
     state === "capturing" || state === "thinking" || state === "streaming";  const busy =
     state === "listening" ||
@@ -306,7 +282,7 @@ export default function App() {
     setStatus("Checking local model…");
 
     try {
-      const result = await provider.getStatus(selectedModel);
+      const result = await provider.getStatus(MODEL);
       setStatus(result.message);
       setModelAvailable(result.available);
       return result;
@@ -316,7 +292,7 @@ export default function App() {
       setModelAvailable(false);
       return {
         available: false,
-        model: selectedModel,
+        model: MODEL,
         message,
       };
     }
@@ -324,7 +300,7 @@ export default function App() {
 
   useEffect(() => {
     void refreshModelStatus();
-  }, [provider, selectedModel]);
+  }, [provider]);
 
   useEffect(() => {
     if (!speechRecognizer) return;
@@ -355,11 +331,9 @@ export default function App() {
   useEffect(() => {
     if (!tauriRuntime) return;
 
-    invoke<boolean>("set_screen_context_enabled", {
-      enabled: initialSettings.screenEnabled,
-    })
+    invoke<boolean>("get_screen_context_enabled")
       .then(setScreenEnabled)
-      .catch(() => setScreenEnabled(initialSettings.screenEnabled));
+      .catch(() => setScreenEnabled(false));
 
     const unlisten = listen<boolean>("screen-context-enabled", (event) => {
       setScreenEnabled(event.payload);
@@ -380,115 +354,6 @@ export default function App() {
       window.localStorage.setItem("oz.microphone", selectedMicrophone);
     }
   }, [selectedMicrophone]);
-
-  useEffect(() => {
-    saveOzSettings({
-      ...appSettings,
-      screenEnabled,
-      selectedMicrophone,
-      spokenAnswers,
-    });
-  }, [appSettings, screenEnabled, selectedMicrophone, spokenAnswers]);
-
-  useEffect(() => {
-    document.documentElement.dataset.ozTheme = appSettings.theme;
-  }, [appSettings.theme]);
-
-  useEffect(() => {
-    if (!tauriRuntime) return;
-    void appWindow.setAlwaysOnTop(appSettings.alwaysOnTop).catch((error) => {
-      setSettingsNotice(
-        errorMessage(error, "Oz could not change the always-on-top setting."),
-      );
-    });
-  }, [tauriRuntime, appSettings.alwaysOnTop]);
-
-  useEffect(() => {
-    if (!tauriRuntime) return;
-    isAutostartEnabled()
-      .then(setLaunchAtStartup)
-      .catch((error) =>
-        setSettingsNotice(
-          errorMessage(error, "Oz could not check the startup setting."),
-        ),
-      );
-  }, [tauriRuntime]);
-
-  useEffect(() => {
-    if (!tauriRuntime || !appSettings.rememberWindowPosition) return;
-
-    const savedPosition = loadWindowPosition();
-    if (savedPosition) {
-      void appWindow
-        .setPosition(new PhysicalPosition(savedPosition.x, savedPosition.y))
-        .catch((error) =>
-          setSettingsNotice(
-            errorMessage(error, "Oz could not restore its window position."),
-          ),
-        );
-    }
-
-    let disposeMoved: (() => void) | undefined;
-    void appWindow
-      .onMoved(({ payload }) => {
-        saveWindowPosition({ x: payload.x, y: payload.y });
-      })
-      .then((dispose) => {
-        disposeMoved = dispose;
-      });
-
-    return () => disposeMoved?.();
-  }, [tauriRuntime, appSettings.rememberWindowPosition]);
-
-  useEffect(() => {
-    if (!tauriRuntime) return;
-
-    const shortcut = appSettings.globalShortcut;
-    let disposed = false;
-
-    async function configureShortcut() {
-      const previousShortcut = activeShortcutRef.current;
-      if (previousShortcut) {
-        await unregister(previousShortcut).catch(() => undefined);
-        activeShortcutRef.current = null;
-      }
-
-      if (disposed || shortcut === "disabled") return;
-
-      await unregister(shortcut).catch(() => undefined);
-      await register(shortcut, (event) => {
-        if (event.state !== "Pressed") return;
-        void (async () => {
-          const visible = await appWindow.isVisible();
-          if (visible) {
-            await appWindow.hide();
-          } else {
-            await appWindow.show();
-            await appWindow.setFocus();
-          }
-        })();
-      });
-
-      if (!disposed) {
-        activeShortcutRef.current = shortcut;
-        setSettingsNotice(null);
-      }
-    }
-
-    void configureShortcut().catch((error) => {
-      setSettingsNotice(
-        errorMessage(error, "That shortcut is unavailable. Choose another one."),
-      );
-    });
-
-    return () => {
-      disposed = true;
-      if (activeShortcutRef.current === shortcut) {
-        activeShortcutRef.current = null;
-        void unregister(shortcut).catch(() => undefined);
-      }
-    };
-  }, [tauriRuntime, appSettings.globalShortcut]);
 
   useEffect(() => {
     saveActiveConversationId(activeConversationId);
@@ -654,7 +519,7 @@ export default function App() {
           {
             requestId,
             question: prompt,
-            model: selectedModel,
+            model: MODEL,
             screen,
             history,
           },
@@ -923,7 +788,6 @@ export default function App() {
     setActiveConversationId(null);
     saveActiveConversationId(null);
     setHistoryOpen(false);
-    setSettingsOpen(false);
     setCopiedMessageId(null);
     setState("ready");
     requestAnimationFrame(() => inputRef.current?.focus());
@@ -995,55 +859,6 @@ export default function App() {
     reset();
   }
 
-  function updateAppSettings(patch: Partial<OzSettings>) {
-    setAppSettings((current) => ({ ...current, ...patch }));
-    setSettingsNotice(null);
-  }
-
-  async function changeLaunchAtStartup(enabled: boolean) {
-    if (!tauriRuntime) return;
-    setSettingsNotice("Updating startup preference…");
-    try {
-      if (enabled) {
-        await enableAutostart();
-      } else {
-        await disableAutostart();
-      }
-      setLaunchAtStartup(enabled);
-      setSettingsNotice(enabled ? "Oz will launch at sign-in." : "Startup launch disabled.");
-    } catch (error) {
-      setSettingsNotice(
-        errorMessage(error, "Oz could not change the startup preference."),
-      );
-    }
-  }
-
-  function exportConversationData() {
-    const latestConversations = upsertConversation(
-      conversations,
-      activeConversationId,
-      messages,
-    );
-    const exportPayload = {
-      product: "Oz",
-      exportedAt: new Date().toISOString(),
-      conversations: latestConversations,
-    };
-    const blob = new Blob([JSON.stringify(exportPayload, null, 2)], {
-      type: "application/json",
-    });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download =
-      "oz-conversations-" + new Date().toISOString().slice(0, 10) + ".json";
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 0);
-    setSettingsNotice("Conversation export created.");
-  }
-
   async function minimizeWindow() {
     if (tauriRuntime) await appWindow.minimize();
   }
@@ -1052,23 +867,18 @@ export default function App() {
     if (tauriRuntime) await appWindow.close();
   }
 
-  async function setScreenContext(enabled: boolean) {
-    const previous = screenEnabled;
+  async function toggleScreenContext() {
+    const enabled = !screenEnabled;
     setScreenEnabled(enabled);
+
     if (tauriRuntime) {
       try {
         await invoke("set_screen_context_enabled", { enabled });
       } catch {
-        setScreenEnabled(previous);
+        setScreenEnabled(!enabled);
       }
     }
-  }
-
-  async function toggleScreenContext() {
-    await setScreenContext(!screenEnabled);
-  }
-
-  const latestAssistant = [...messages]
+  }  const latestAssistant = [...messages]
     .reverse()
     .find((message) => message.role === "assistant");
   const latestError =
@@ -1202,29 +1012,10 @@ export default function App() {
               aria-label="Open conversation history"
               title="Conversation history"
               aria-expanded={historyOpen}
-              onClick={() => {
-                setSettingsOpen(false);
-                setHistoryOpen(true);
-              }}
+              onClick={() => setHistoryOpen(true)}
             >
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M5 6h14M5 12h14M5 18h9" />
-              </svg>
-            </button>
-            <button
-              type="button"
-              className="icon-button settings-trigger"
-              aria-label="Open settings"
-              title="Settings"
-              aria-expanded={settingsOpen}
-              onClick={() => {
-                setHistoryOpen(false);
-                setSettingsOpen(true);
-              }}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <circle cx="12" cy="12" r="3" />
-                <path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1a8 8 0 0 0-1.7-1L14.5 3h-5l-.4 3.1a8 8 0 0 0-1.7 1L5 6.1 3 9.5 5 11a7 7 0 0 0 0 2l-2 1.5 2 3.4 2.4-1a8 8 0 0 0 1.7 1l.4 3.1h5l.4-3.1a8 8 0 0 0 1.7-1l2.4 1 2-3.4-2-1.5a7 7 0 0 0 .1-1z" />
               </svg>
             </button>
             {messages.length > 0 && (
@@ -1274,45 +1065,6 @@ export default function App() {
           onOpenConversation={openConversation}
           onRenameConversation={renameConversation}
           onDeleteConversation={deleteConversation}
-          onClearHistory={clearConversationHistory}
-        />
-        <SettingsDrawer
-          open={settingsOpen}
-          disabled={busy}
-          tauriRuntime={tauriRuntime}
-          model={selectedModel}
-          theme={appSettings.theme}
-          alwaysOnTop={appSettings.alwaysOnTop}
-          launchAtStartup={launchAtStartup}
-          rememberWindowPosition={appSettings.rememberWindowPosition}
-          globalShortcut={appSettings.globalShortcut}
-          screenEnabled={screenEnabled}
-          microphones={microphones}
-          selectedMicrophone={selectedMicrophone}
-          voiceAvailable={voiceStatus.available}
-          spokenAnswers={spokenAnswers}
-          speechAvailable={speechSynthesizer.available}
-          notice={settingsNotice}
-          hasConversationData={conversations.length > 0 || messages.length > 0}
-          onClose={() => setSettingsOpen(false)}
-          onModelChange={(model) => updateAppSettings({ model })}
-          onThemeChange={(theme) => updateAppSettings({ theme })}
-          onAlwaysOnTopChange={(alwaysOnTop) =>
-            updateAppSettings({ alwaysOnTop })
-          }
-          onLaunchAtStartupChange={(enabled) =>
-            void changeLaunchAtStartup(enabled)
-          }
-          onRememberWindowPositionChange={(rememberWindowPosition) =>
-            updateAppSettings({ rememberWindowPosition })
-          }
-          onGlobalShortcutChange={(globalShortcut) =>
-            updateAppSettings({ globalShortcut })
-          }
-          onScreenEnabledChange={(enabled) => void setScreenContext(enabled)}
-          onMicrophoneChange={setSelectedMicrophone}
-          onSpokenAnswersChange={setSpokenAnswers}
-          onExportData={exportConversationData}
           onClearHistory={clearConversationHistory}
         />
         <div className="content">
@@ -1626,7 +1378,7 @@ export default function App() {
             </details>
           )}
 
-          <span className="shortcut">{shortcutLabel(appSettings.globalShortcut)}</span>
+          <span className="shortcut">Ctrl&nbsp; Shift&nbsp; Space</span>
         </footer>
       </section>
     </main>
